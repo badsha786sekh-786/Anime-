@@ -24,6 +24,10 @@
 // hai — taaki repo mein "dead weight" (stale/unused files) jama na ho. Ye
 // har roz (daily workflow run ke saath) apne aap hota hai, kisi manual check
 // ki zaroorat nahi.
+//
+// NOTE (analytics): Har generated page (individual anime pages + the
+// browse-all index) mein OpenDomains ka analytics script bhi inject hota
+// hai, taaki inn pages ka traffic bhi track ho sake, homepage ki tarah.
 
 import { writeFile, mkdir, readFile, readdir, unlink } from 'node:fs/promises';
 import path from 'node:path';
@@ -34,6 +38,8 @@ const PAGE_COUNT = 5;      // AniList se kitne "pages" fetch karne hain
 const PER_PAGE = 40;       // har page mein kitne anime (max ~50 AniList allow karta hai)
 
 const API = 'https://graphql.anilist.co';
+
+const ANALYTICS_SCRIPT = '<script defer src="https://analytics.open-domains.com/script.js" data-website-id="c72153eb-a0fc-4580-bae2-76db6e9a799c"></script>';
 
 const QUERY = `
   query ($page: Int, $perPage: Int) {
@@ -166,6 +172,7 @@ function pageHTML(m) {
 <meta name="twitter:description" content="${esc(synopsis.slice(0, 200))}">
 <meta name="twitter:image" content="${esc(img)}">
 <script type="application/ld+json">${JSON.stringify(jsonLd)}</script>
+${ANALYTICS_SCRIPT}
 <style>
   body{background:#0E1116;color:#F4F1EA;font-family:sans-serif;max-width:720px;margin:0 auto;padding:24px 16px 60px;line-height:1.6;}
   a{color:#FFB454;}
@@ -249,6 +256,7 @@ function indexHTML(list) {
 <title>Browse All Anime | BOSS Anime Club</title>
 <meta name="description" content="Browse the full list of anime on BOSS Anime Club &mdash; info, episodes, genres and more.">
 <link rel="canonical" href="${SITE_URL}/anime/index.html">
+${ANALYTICS_SCRIPT}
 <style>
   body{background:#0E1116;color:#F4F1EA;font-family:sans-serif;max-width:720px;margin:0 auto;padding:24px 16px 60px;}
   a{color:#FFB454;text-decoration:none;}
