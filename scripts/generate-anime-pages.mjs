@@ -1,18 +1,64 @@
+// generate-anime-pages.mjs
+//
+// Ye script AniList se top popular + trending anime ka data leti hai, aur har
+// anime ke liye ek ALAG static HTML page banati hai (JavaScript ke bina bhi
+// pura content dikhta hai) — taaki Google har anime ko individually crawl aur
+// index kar sake. Ye GitHub Actions se daily automatically chalti hai.
+//
+// Output: /anime/<slug>-<id>.html  (ek file per anime)
+//         /anime/index.html        (sabhi anime ki list, links ke saath)
+//         /sitemap.xml             (Google ko sabhi URLs batane ke liye)
+//
+// Kuch bhi manually chalane ki zaroorat nahi — GitHub Actions workflow
+// (.github/workflows/generate-pages.yml) ise apne aap chalata hai.
+//
+// NOTE: Special symbols (arrows, speaker, stop icon) yahan HTML entities
+// (jaise &#9656;) ya JS unicode escapes (jaise \u23F9) ke roop mein likhe
+// gaye hain, raw emoji/unicode characters ke bajaye. Wajah: jab is file ko
+// GitHub ke mobile web-editor mein copy-paste kiya jaata hai, raw unicode
+// characters kabhi-kabhi corrupt (mojibake) ho jaate hain. Entities/escapes
+// plain ASCII hote hain, isliye copy-paste mein kabhi kharab nahi hote.
+//
+// NOTE (cleanup): Har run mein, agar koi purani anime page ab top-200
+// popularity list mein nahi hai, to uski file automatically delete ho jaati
+// hai — taaki repo mein "dead weight" (stale/unused files) jama na ho. Ye
+// har roz (daily workflow run ke saath) apne aap hota hai, kisi manual check
+// ki zaroorat nahi.
+//
+// NOTE (safety): Agar AniList API fail ho jaye (rate limit, HTTP 403/5xx,
+// network issue, waghera) to fetchAllAnime() empty list return karegi. Aise
+// mein cleanup logic galti se saari purani (achhi) files ko "stale" samajh
+// kar delete kar sakta hai. Isse bachne ke liye, agar list khali aaye to
+// script turant ruk jaati hai (koi file likhi/delete nahi hoti) — taaki ek
+// temporary API glitch se poora anime/ folder khali na ho jaye.
+//
+// NOTE (resilience): AniList (Cloudflare ke peeche) kabhi-kabhi GitHub
+// Actions ke shared/datacenter IPs ko bot-jaisa traffic samajh kar
+// temporarily block (HTTP 403) kar deta hai, chahe browser se wahi request
+// theek chale. Isse kam karne ke liye: (1) ek real browser jaisa User-Agent
+// header bheja jaata hai, aur (2) 403/429/5xx milne par thodi der wait
+// karke request ko 3 baar tak retry kiya jaata hai, poora process turant
+// abort karne ke bajaye.
+//
+// NOTE (analytics): Har generated page (individual anime pages + the
+// browse-all index) mein OpenDomains ka analytics script bhi inject hota
+// hai, taaki inn pages ka traffic bhi track ho sake, homepage ki tarah.
+
 import { writeFile, mkdir, readFile, readdir, unlink } from 'node:fs/promises';
 import path from 'node:path';
 
 const SITE_URL = 'https://anime.is-cool.dev';
 const OUT_DIR = path.join(process.cwd(), 'anime');
-const PAGE_COUNT = 5;
-const PER_PAGE = 40;
+const PAGE_COUNT = 5;      // AniList se kitne "pages" fetch karne hain
+const PER_PAGE = 40;       // har page mein kitne anime (max ~50 AniList allow karta hai)
 
-// Apne Cloudflare Worker ka sahi URL yahan daalein
-const API = 'https://anilist-proxy.badsha786sekh-786.workers.dev'; 
+const API = 'https://graphql.anilist.co';
 
-// Clean browser headers without unnecessary overrides
+// Real browser jaisa User-Agent — isse Cloudflare/AniList ko request
+// "automated script" ke bajaye normal traffic jaisa dikhta hai.
 const REQUEST_HEADERS = {
   'Content-Type': 'application/json',
-  'Accept': 'application/json',
+  Accept: 'application/json',
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
 };
 
@@ -53,6 +99,9 @@ function slugify(title) {
     .slice(0, 60) || 'untitled';
 }
 
+// Ek AniList page fetch karta hai, aur agar rate-limit/temporary error
+// (403, 429, ya 5xx) mile to thodi der wait karke retry karta hai (max 3
+// attempts) isse pehle ki poori script fail declare ho.
 async function fetchPageWithRetry(page, maxAttempts = 3) {
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const res = await fetch(API, {
@@ -67,7 +116,7 @@ async function fetchPageWithRetry(page, maxAttempts = 3) {
 
     const retryable = res.status === 403 || res.status === 429 || res.status >= 500;
     if (retryable && attempt < maxAttempts) {
-      const waitMs = 3000 * attempt;
+      const waitMs = 2000 * attempt; // 2s, then 4s
       console.error(`AniList request failed on page ${page}: HTTP ${res.status} (attempt ${attempt}/${maxAttempts}) — retrying in ${waitMs / 1000}s...`);
       await new Promise((r) => setTimeout(r, waitMs));
       continue;
@@ -95,11 +144,15 @@ async function fetchAllAnime() {
         all.push(m);
       }
     }
-    await new Promise((r) => setTimeout(r, 1500));
+    // AniList free API: be polite between calls.
+    await new Promise((r) => setTimeout(r, 700));
   }
   return all;
 }
 
+// Har page ke liye thoda "apna" unique text banata hai (AniList ke raw
+// description ke alawa) — isse Google ko duplicate-content nahi lagta,
+// kyunki ye text sirf is site par hai aur data ke hisaab se generate hota hai.
 function buildEditorNote(m, title, genres, studio, year, score) {
   const genreList = genres.length ? genres.slice(0, 3).join(', ') : 'multiple genres';
   const scoreLine = m.averageScore != null
@@ -133,6 +186,7 @@ function pageHTML(m) {
   const episodes = m.episodes || '—';
   const url = `${SITE_URL}/anime/${slugify(title)}-${m.id}.html`;
   const editorNote = buildEditorNote(m, title, genres, studio, year, score);
+  // Speech synthesis reads this: synopsis + editor note, stripped of markup.
   const speakText = `${synopsis} ${editorNote}`.replace(/<[^>]+>/g, '');
 
   const jsonLd = {
@@ -266,7 +320,7 @@ ${rows}
 }
 
 function sitemapXML(list) {
-  const today = new Date().toISOString().slice(0, 10);
+  const today = new Date().toISOString().slice(0, 10); // e.g. "2026-08-31"
   const urls = list
     .map((m) => {
       const title = m.title?.english || m.title?.romaji || 'Untitled';
@@ -283,12 +337,17 @@ ${urls}
 }
 
 async function main() {
-  console.log('Fetching anime list directly from AniList...');
+  console.log('Fetching anime list from AniList...');
   const list = await fetchAllAnime();
   console.log(`Fetched ${list.length} anime.`);
 
+  // SAFETY CHECK: agar AniList se kuch bhi data nahi mila (API down,
+  // rate-limited, HTTP 403/5xx, network issue, waghera), to yahin ruk jao.
+  // Warna neeche wala cleanup logic saari (bilkul theek) purani files ko
+  // "stale" samajh kar delete kar dega, kyunki khaali list mein koi bhi
+  // anime "current" nahi dikhega.
   if (list.length === 0) {
-    console.error('Fetched 0 anime from AniList — aborting without touching any files.');
+    console.error('Fetched 0 anime from AniList — aborting without touching any files. This usually means the AniList API is temporarily down, rate-limited, or blocked (e.g. HTTP 403/5xx). Nothing was deleted or overwritten. Try re-running the workflow in a few minutes.');
     process.exit(1);
   }
 
@@ -304,6 +363,11 @@ async function main() {
     await writeFile(filePath, pageHTML(m), 'utf8');
   }
 
+  // Cleanup: koi bhi purani anime page jo ab top-200 popularity list mein
+  // nahi hai, use delete kar do — taaki dead weight jama na ho. index.html
+  // ko chhod dete hain kyunki wo har baar niche dobara likha jaata hai.
+  // (Yeh code sirf tab tak pahunchta hai jab list.length > 0 ho, upar wale
+  // safety check ki wajah se.)
   const existingFiles = await readdir(OUT_DIR);
   let deletedCount = 0;
   for (const file of existingFiles) {
@@ -326,3 +390,4 @@ main().catch((err) => {
   console.error(err);
   process.exit(1);
 });
+
