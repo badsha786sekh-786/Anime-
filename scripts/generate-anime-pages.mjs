@@ -52,7 +52,7 @@ const OUT_DIR = path.join(process.cwd(), 'anime');
 const PAGE_COUNT = 5;      // AniList se kitne "pages" fetch karne hain
 const PER_PAGE = 40;       // har page mein kitne anime (max ~50 AniList allow karta hai)
 
-const API = 'https://graphql.anilist.co';
+const API = 'https://anilist-proxy.badsha90sekh.workers.dev';
 
 // Real browser jaisa User-Agent — isse Cloudflare/AniList ko request
 // "automated script" ke bajaye normal traffic jaisa dikhta hai.
