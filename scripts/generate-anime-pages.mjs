@@ -6,8 +6,8 @@ const OUT_DIR = path.join(process.cwd(), 'anime');
 const PAGE_COUNT = 5;
 const PER_PAGE = 40;
 
-// Direct AniList GraphQL Endpoint
-const API = 'https://graphql.anilist.co';
+// Apne Cloudflare Worker ka sahi URL yahan daalein
+const API = 'https://anilist-proxy.badsha786sekh-786.workers.dev'; 
 
 // Clean browser headers without unnecessary overrides
 const REQUEST_HEADERS = {
