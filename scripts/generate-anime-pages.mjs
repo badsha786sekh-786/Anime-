@@ -25,6 +25,13 @@
 // har roz (daily workflow run ke saath) apne aap hota hai, kisi manual check
 // ki zaroorat nahi.
 //
+// NOTE (safety): Agar AniList API fail ho jaye (rate limit, HTTP 403/5xx,
+// network issue, waghera) to fetchAllAnime() empty list return karegi. Aise
+// mein cleanup logic galti se saari purani (achhi) files ko "stale" samajh
+// kar delete kar sakta hai. Isse bachne ke liye, agar list khali aaye to
+// script turant ruk jaati hai (koi file likhi/delete nahi hoti) — taaki ek
+// temporary API glitch se poora anime/ folder khali na ho jaye.
+//
 // NOTE (analytics): Har generated page (individual anime pages + the
 // browse-all index) mein OpenDomains ka analytics script bhi inject hota
 // hai, taaki inn pages ka traffic bhi track ho sake, homepage ki tarah.
@@ -295,6 +302,18 @@ async function main() {
   const list = await fetchAllAnime();
   console.log(`Fetched ${list.length} anime.`);
 
+  // SAFETY CHECK: agar AniList se kuch bhi data nahi mila (API down,
+  // rate-limited, HTTP 403/5xx, network issue, waghera), to yahin ruk jao.
+  // Warna neeche wala cleanup logic saari (bilkul theek) purani files ko
+  // "stale" samajh kar delete kar dega, kyunki khaali list mein koi bhi
+  // anime "current" nahi dikhega. Ye ek baar pehle ho chuka hai (AniList ne
+  // HTTP 403 diya tha aur poora anime/ folder khali ho gaya tha) — isliye ye
+  // check zaroori hai.
+  if (list.length === 0) {
+    console.error('Fetched 0 anime from AniList — aborting without touching any files. This usually means the AniList API is temporarily down, rate-limited, or blocked (e.g. HTTP 403/5xx). Nothing was deleted or overwritten. Try re-running the workflow in a few minutes.');
+    process.exit(1);
+  }
+
   await mkdir(OUT_DIR, { recursive: true });
 
   const currentFiles = new Set();
@@ -310,6 +329,8 @@ async function main() {
   // Cleanup: koi bhi purani anime page jo ab top-200 popularity list mein
   // nahi hai, use delete kar do — taaki dead weight jama na ho. index.html
   // ko chhod dete hain kyunki wo har baar niche dobara likha jaata hai.
+  // (Yeh code sirf tab tak pahunchta hai jab list.length > 0 ho, upar wale
+  // safety check ki wajah se.)
   const existingFiles = await readdir(OUT_DIR);
   let deletedCount = 0;
   for (const file of existingFiles) {
