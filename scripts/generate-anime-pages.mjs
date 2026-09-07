@@ -32,6 +32,14 @@
 // script turant ruk jaati hai (koi file likhi/delete nahi hoti) — taaki ek
 // temporary API glitch se poora anime/ folder khali na ho jaye.
 //
+// NOTE (resilience): AniList (Cloudflare ke peeche) kabhi-kabhi GitHub
+// Actions ke shared/datacenter IPs ko bot-jaisa traffic samajh kar
+// temporarily block (HTTP 403) kar deta hai, chahe browser se wahi request
+// theek chale. Isse kam karne ke liye: (1) ek real browser jaisa User-Agent
+// header bheja jaata hai, aur (2) 403/429/5xx milne par thodi der wait
+// karke request ko 3 baar tak retry kiya jaata hai, poora process turant
+// abort karne ke bajaye.
+//
 // NOTE (analytics): Har generated page (individual anime pages + the
 // browse-all index) mein OpenDomains ka analytics script bhi inject hota
 // hai, taaki inn pages ka traffic bhi track ho sake, homepage ki tarah.
@@ -45,6 +53,14 @@ const PAGE_COUNT = 5;      // AniList se kitne "pages" fetch karne hain
 const PER_PAGE = 40;       // har page mein kitne anime (max ~50 AniList allow karta hai)
 
 const API = 'https://graphql.anilist.co';
+
+// Real browser jaisa User-Agent — isse Cloudflare/AniList ko request
+// "automated script" ke bajaye normal traffic jaisa dikhta hai.
+const REQUEST_HEADERS = {
+  'Content-Type': 'application/json',
+  Accept: 'application/json',
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+};
 
 const ANALYTICS_SCRIPT = '<script defer src="https://analytics.open-domains.com/script.js" data-website-id="c72153eb-a0fc-4580-bae2-76db6e9a799c"></script>';
 
@@ -83,17 +99,40 @@ function slugify(title) {
     .slice(0, 60) || 'untitled';
 }
 
+// Ek AniList page fetch karta hai, aur agar rate-limit/temporary error
+// (403, 429, ya 5xx) mile to thodi der wait karke retry karta hai (max 3
+// attempts) isse pehle ki poori script fail declare ho.
+async function fetchPageWithRetry(page, maxAttempts = 3) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const res = await fetch(API, {
+      method: 'POST',
+      headers: REQUEST_HEADERS,
+      body: JSON.stringify({ query: QUERY, variables: { page, perPage: PER_PAGE } }),
+    });
+
+    if (res.ok) {
+      return res;
+    }
+
+    const retryable = res.status === 403 || res.status === 429 || res.status >= 500;
+    if (retryable && attempt < maxAttempts) {
+      const waitMs = 2000 * attempt; // 2s, then 4s
+      console.error(`AniList request failed on page ${page}: HTTP ${res.status} (attempt ${attempt}/${maxAttempts}) — retrying in ${waitMs / 1000}s...`);
+      await new Promise((r) => setTimeout(r, waitMs));
+      continue;
+    }
+
+    console.error(`AniList request failed on page ${page}: HTTP ${res.status} (attempt ${attempt}/${maxAttempts}) — giving up on this page.`);
+    return res;
+  }
+}
+
 async function fetchAllAnime() {
   const all = [];
   const seen = new Set();
   for (let page = 1; page <= PAGE_COUNT; page++) {
-    const res = await fetch(API, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-      body: JSON.stringify({ query: QUERY, variables: { page, perPage: PER_PAGE } }),
-    });
-    if (!res.ok) {
-      console.error(`AniList request failed on page ${page}: HTTP ${res.status}`);
+    const res = await fetchPageWithRetry(page);
+    if (!res || !res.ok) {
       break;
     }
     const json = await res.json();
@@ -306,9 +345,7 @@ async function main() {
   // rate-limited, HTTP 403/5xx, network issue, waghera), to yahin ruk jao.
   // Warna neeche wala cleanup logic saari (bilkul theek) purani files ko
   // "stale" samajh kar delete kar dega, kyunki khaali list mein koi bhi
-  // anime "current" nahi dikhega. Ye ek baar pehle ho chuka hai (AniList ne
-  // HTTP 403 diya tha aur poora anime/ folder khali ho gaya tha) — isliye ye
-  // check zaroori hai.
+  // anime "current" nahi dikhega.
   if (list.length === 0) {
     console.error('Fetched 0 anime from AniList — aborting without touching any files. This usually means the AniList API is temporarily down, rate-limited, or blocked (e.g. HTTP 403/5xx). Nothing was deleted or overwritten. Try re-running the workflow in a few minutes.');
     process.exit(1);
