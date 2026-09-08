@@ -25,20 +25,20 @@
 // har roz (daily workflow run ke saath) apne aap hota hai, kisi manual check
 // ki zaroorat nahi.
 //
-// NOTE (safety): Agar AniList (ya proxy) fail ho jaye (rate limit, HTTP
-// 403/5xx, network issue, waghera) to fetchAllAnime() empty list return
-// karegi. Aise mein cleanup logic galti se saari purani (achhi) files ko
-// "stale" samajh kar delete kar sakta hai. Isse bachne ke liye, agar list
-// khali aaye to script turant ruk jaati hai (koi file likhi/delete nahi
-// hoti) — taaki ek temporary API glitch se poora anime/ folder khali na ho.
+// NOTE (safety): Agar AniList API fail ho jaye (rate limit, HTTP 403/5xx,
+// network issue, waghera) to fetchAllAnime() empty list return karegi. Aise
+// mein cleanup logic galti se saari purani (achhi) files ko "stale" samajh
+// kar delete kar sakta hai. Isse bachne ke liye, agar list khali aaye to
+// script turant ruk jaati hai (koi file likhi/delete nahi hoti) — taaki ek
+// temporary API glitch se poora anime/ folder khali na ho jaye.
 //
-// NOTE (proxy): GitHub Actions ke shared/datacenter IPs ko AniList ne
-// manually block kar diya tha ("You have been manually blocked" error).
-// Isse bachne ke liye, ab requests seedhe AniList ko na jaakar, ek Cloudflare
-// Worker proxy (anilist-proxy.badsha90sekh.workers.dev) ke through jaati
-// hain — jo Cloudflare ke network se AniList ko call karta hai. Worker khud
-// ek secret header (X-Proxy-Secret) check karta hai taaki koi aur is proxy
-// ko misuse na kar sake.
+// NOTE (resilience): AniList (Cloudflare ke peeche) kabhi-kabhi GitHub
+// Actions ke shared/datacenter IPs ko bot-jaisa traffic samajh kar
+// temporarily block (HTTP 403) kar deta hai, chahe browser se wahi request
+// theek chale. Isse kam karne ke liye: (1) ek real browser jaisa User-Agent
+// header bheja jaata hai, aur (2) 403/429/5xx milne par thodi der wait
+// karke request ko 3 baar tak retry kiya jaata hai, poora process turant
+// abort karne ke bajaye.
 //
 // NOTE (analytics): Har generated page (individual anime pages + the
 // browse-all index) mein OpenDomains ka analytics script bhi inject hota
@@ -52,16 +52,14 @@ const OUT_DIR = path.join(process.cwd(), 'anime');
 const PAGE_COUNT = 5;      // AniList se kitne "pages" fetch karne hain
 const PER_PAGE = 40;       // har page mein kitne anime (max ~50 AniList allow karta hai)
 
-// AniList ko seedha call karne ke bajaye, apne Cloudflare Worker proxy se
-// call karte hain — isse GitHub Actions ke IP block wala issue bypass hota
-// hai (Worker Cloudflare ke apne network se request bhejta hai).
-const API = 'https://anilist-proxy.badsha90sekh.workers.dev';
-const PROXY_SECRET = 'boss-anime-9f3k2-secret-2026';
+const API = 'https://graphql.anilist.co';
 
+// Real browser jaisa User-Agent — isse Cloudflare/AniList ko request
+// "automated script" ke bajaye normal traffic jaisa dikhta hai.
 const REQUEST_HEADERS = {
   'Content-Type': 'application/json',
   Accept: 'application/json',
-  'X-Proxy-Secret': PROXY_SECRET,
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
 };
 
 const ANALYTICS_SCRIPT = '<script defer src="https://analytics.open-domains.com/script.js" data-website-id="c72153eb-a0fc-4580-bae2-76db6e9a799c"></script>';
@@ -101,9 +99,9 @@ function slugify(title) {
     .slice(0, 60) || 'untitled';
 }
 
-// Ek page fetch karta hai proxy ke through, aur agar rate-limit/temporary
-// error (403, 429, ya 5xx) mile to thodi der wait karke retry karta hai
-// (max 3 attempts) isse pehle ki poori script fail declare ho.
+// Ek AniList page fetch karta hai, aur agar rate-limit/temporary error
+// (403, 429, ya 5xx) mile to thodi der wait karke retry karta hai (max 3
+// attempts) isse pehle ki poori script fail declare ho.
 async function fetchPageWithRetry(page, maxAttempts = 3) {
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const res = await fetch(API, {
@@ -119,12 +117,12 @@ async function fetchPageWithRetry(page, maxAttempts = 3) {
     const retryable = res.status === 403 || res.status === 429 || res.status >= 500;
     if (retryable && attempt < maxAttempts) {
       const waitMs = 2000 * attempt; // 2s, then 4s
-      console.error(`Proxy request failed on page ${page}: HTTP ${res.status} (attempt ${attempt}/${maxAttempts}) — retrying in ${waitMs / 1000}s...`);
+      console.error(`AniList request failed on page ${page}: HTTP ${res.status} (attempt ${attempt}/${maxAttempts}) — retrying in ${waitMs / 1000}s...`);
       await new Promise((r) => setTimeout(r, waitMs));
       continue;
     }
 
-    console.error(`Proxy request failed on page ${page}: HTTP ${res.status} (attempt ${attempt}/${maxAttempts}) — giving up on this page.`);
+    console.error(`AniList request failed on page ${page}: HTTP ${res.status} (attempt ${attempt}/${maxAttempts}) — giving up on this page.`);
     return res;
   }
 }
@@ -339,17 +337,17 @@ ${urls}
 }
 
 async function main() {
-  console.log('Fetching anime list via proxy...');
+  console.log('Fetching anime list from AniList...');
   const list = await fetchAllAnime();
   console.log(`Fetched ${list.length} anime.`);
 
-  // SAFETY CHECK: agar proxy/AniList se kuch bhi data nahi mila (down,
+  // SAFETY CHECK: agar AniList se kuch bhi data nahi mila (API down,
   // rate-limited, HTTP 403/5xx, network issue, waghera), to yahin ruk jao.
   // Warna neeche wala cleanup logic saari (bilkul theek) purani files ko
   // "stale" samajh kar delete kar dega, kyunki khaali list mein koi bhi
   // anime "current" nahi dikhega.
   if (list.length === 0) {
-    console.error('Fetched 0 anime — aborting without touching any files. This usually means the proxy/AniList is temporarily down, rate-limited, or blocked. Nothing was deleted or overwritten. Try re-running the workflow in a few minutes.');
+    console.error('Fetched 0 anime from AniList — aborting without touching any files. This usually means the AniList API is temporarily down, rate-limited, or blocked (e.g. HTTP 403/5xx). Nothing was deleted or overwritten. Try re-running the workflow in a few minutes.');
     process.exit(1);
   }
 
