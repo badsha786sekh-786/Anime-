@@ -1,393 +1,2313 @@
-// generate-anime-pages.mjs
+// scripts/generate-anime-pages.mjs
 //
-// Ye script AniList se top popular + trending anime ka data leti hai, aur har
-// anime ke liye ek ALAG static HTML page banati hai (JavaScript ke bina bhi
-// pura content dikhta hai) — taaki Google har anime ko individually crawl aur
-// index kar sake. Ye GitHub Actions se daily automatically chalti hai.
+// BOSS Anime Club - Static Anime SEO Page Generator
 //
-// Output: /anime/<slug>-<id>.html  (ek file per anime)
-//         /anime/index.html        (sabhi anime ki list, links ke saath)
-//         /sitemap.xml             (Google ko sabhi URLs batane ke liye)
+// Primary API:
+//   AniList GraphQL
 //
-// Kuch bhi manually chalane ki zaroorat nahi — GitHub Actions workflow
-// (.github/workflows/generate-pages.yml) ise apne aap chalata hai.
+// Fallback API:
+//   Jikan / MyAnimeList public API
 //
-// NOTE: Special symbols (arrows, speaker, stop icon) yahan HTML entities
-// (jaise &#9656;) ya JS unicode escapes (jaise \u23F9) ke roop mein likhe
-// gaye hain, raw emoji/unicode characters ke bajaye. Wajah: jab is file ko
-// GitHub ke mobile web-editor mein copy-paste kiya jaata hai, raw unicode
-// characters kabhi-kabhi corrupt (mojibake) ho jaate hain. Entities/escapes
-// plain ASCII hote hain, isliye copy-paste mein kabhi kharab nahi hote.
+// Output:
+//   /anime/<slug>-<id>.html
+//   /anime/index.html
+//   /sitemap.xml
 //
-// NOTE (cleanup): Har run mein, agar koi purani anime page ab top-200
-// popularity list mein nahi hai, to uski file automatically delete ho jaati
-// hai — taaki repo mein "dead weight" (stale/unused files) jama na ho. Ye
-// har roz (daily workflow run ke saath) apne aap hota hai, kisi manual check
-// ki zaroorat nahi.
+// IMPORTANT SAFETY:
+// Agar dono APIs se data nahi milta, script koi existing anime file
+// delete/overwrite nahi karegi.
 //
-// NOTE (safety): Agar AniList API fail ho jaye (rate limit, HTTP 403/5xx,
-// network issue, waghera) to fetchAllAnime() empty list return karegi. Aise
-// mein cleanup logic galti se saari purani (achhi) files ko "stale" samajh
-// kar delete kar sakta hai. Isse bachne ke liye, agar list khali aaye to
-// script turant ruk jaati hai (koi file likhi/delete nahi hoti) — taaki ek
-// temporary API glitch se poora anime/ folder khali na ho jaye.
+// GitHub Actions ke liye designed.
 //
-// NOTE (resilience): AniList (Cloudflare ke peeche) kabhi-kabhi GitHub
-// Actions ke shared/datacenter IPs ko bot-jaisa traffic samajh kar
-// temporarily block (HTTP 403) kar deta hai, chahe browser se wahi request
-// theek chale. Isse kam karne ke liye: (1) ek real browser jaisa User-Agent
-// header bheja jaata hai, aur (2) 403/429/5xx milne par thodi der wait
-// karke request ko 3 baar tak retry kiya jaata hai, poora process turant
-// abort karne ke bajaye.
-//
-// NOTE (analytics): Har generated page (individual anime pages + the
-// browse-all index) mein OpenDomains ka analytics script bhi inject hota
-// hai, taaki inn pages ka traffic bhi track ho sake, homepage ki tarah.
 
-import { writeFile, mkdir, readFile, readdir, unlink } from 'node:fs/promises';
+import {
+  writeFile,
+  mkdir,
+  readdir,
+  unlink,
+} from 'node:fs/promises';
+
 import path from 'node:path';
 
+
+// ============================================================
+// CONFIG
+// ============================================================
+
 const SITE_URL = 'https://anime.is-cool.dev';
+
 const OUT_DIR = path.join(process.cwd(), 'anime');
-const PAGE_COUNT = 5;      // AniList se kitne "pages" fetch karne hain
-const PER_PAGE = 40;       // har page mein kitne anime (max ~50 AniList allow karta hai)
 
-const API = 'https://graphql.anilist.co';
+const TARGET_COUNT = 200;
 
-// Real browser jaisa User-Agent — isse Cloudflare/AniList ko request
-// "automated script" ke bajaye normal traffic jaisa dikhta hai.
+// AniList allows large pages.
+// 5 x 40 = 200.
+const ANILIST_PER_PAGE = 40;
+const ANILIST_MAX_PAGES = 5;
+
+// Jikan normally returns 25 items per page.
+// 8 x 25 = 200.
+const JIKAN_PER_PAGE = 25;
+const JIKAN_MAX_PAGES = 8;
+
+const ANILIST_API = 'https://graphql.anilist.co';
+
+const JIKAN_API = 'https://api.jikan.moe/v4/top/anime';
+
+
+// ============================================================
+// ANALYTICS
+// ============================================================
+
+const ANALYTICS_SCRIPT =
+  '<script defer src="https://analytics.open-domains.com/script.js" ' +
+  'data-website-id="c72153eb-a0fc-4580-bae2-76db6e9a799c"></script>';
+
+
+// ============================================================
+// BROWSER-LIKE HEADERS
+// ============================================================
+
 const REQUEST_HEADERS = {
   'Content-Type': 'application/json',
-  Accept: 'application/json',
-  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  'Accept': 'application/json',
+  'User-Agent':
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
+    'AppleWebKit/537.36 (KHTML, like Gecko) ' +
+    'Chrome/124.0.0.0 Safari/537.36',
 };
 
-const ANALYTICS_SCRIPT = '<script defer src="https://analytics.open-domains.com/script.js" data-website-id="c72153eb-a0fc-4580-bae2-76db6e9a799c"></script>';
 
-const QUERY = `
+// ============================================================
+// ANILIST QUERY
+// ============================================================
+
+const ANILIST_QUERY = `
   query ($page: Int, $perPage: Int) {
     Page(page: $page, perPage: $perPage) {
-      media(sort: POPULARITY_DESC, type: ANIME) {
+      pageInfo {
+        currentPage
+        hasNextPage
+        total
+      }
+
+      media(
+        sort: POPULARITY_DESC
+        type: ANIME
+      ) {
         id
-        title { romaji english native }
-        coverImage { extraLarge large }
+
+        title {
+          romaji
+          english
+          native
+        }
+
+        coverImage {
+          extraLarge
+          large
+          medium
+        }
+
         bannerImage
+
         averageScore
         episodes
         format
         status
         genres
+
         description(asHtml: false)
-        startDate { year }
-        studios(isMain: true) { nodes { name } }
+
+        startDate {
+          year
+          month
+          day
+        }
+
+        studios(
+          isMain: true
+        ) {
+          nodes {
+            name
+          }
+        }
       }
     }
   }
 `;
 
-function esc(s) {
-  return String(s || '').replace(/[&<>"']/g, (c) => ({
-    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
-  }[c]));
+
+// ============================================================
+// HELPERS
+// ============================================================
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+
+function esc(value) {
+  return String(value ?? '').replace(/[&<>"']/g, (char) => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;',
+  })[char]);
+}
+
+
+function escapeAttr(value) {
+  return esc(value);
+}
+
+
+function stripHtml(value) {
+  return String(value ?? '')
+    .replace(/<br\s*\/?>/gi, ' ')
+    .replace(/<\/p>/gi, ' ')
+    .replace(/<[^>]+>/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+
+function truncate(value, maxLength) {
+  const text = String(value ?? '').trim();
+
+  if (text.length <= maxLength) {
+    return text;
+  }
+
+  return text.slice(0, maxLength).replace(/\s+\S*$/, '') + '...';
+}
+
 
 function slugify(title) {
   return String(title || 'untitled')
+    .normalize('NFKD')
+    .replace(/[^\x00-\x7F]/g, '')
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '')
-    .slice(0, 60) || 'untitled';
+    .slice(0, 60)
+    || 'untitled';
 }
 
-// Ek AniList page fetch karta hai, aur agar rate-limit/temporary error
-// (403, 429, ya 5xx) mile to thodi der wait karke retry karta hai (max 3
-// attempts) isse pehle ki poori script fail declare ho.
-async function fetchPageWithRetry(page, maxAttempts = 3) {
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const res = await fetch(API, {
-      method: 'POST',
-      headers: REQUEST_HEADERS,
-      body: JSON.stringify({ query: QUERY, variables: { page, perPage: PER_PAGE } }),
-    });
 
-    if (res.ok) {
-      return res;
-    }
+function getTitle(anime) {
+  return (
+    anime?.title?.english ||
+    anime?.title?.romaji ||
+    anime?.title?.native ||
+    'Untitled Anime'
+  );
+}
 
-    const retryable = res.status === 403 || res.status === 429 || res.status >= 500;
-    if (retryable && attempt < maxAttempts) {
-      const waitMs = 2000 * attempt; // 2s, then 4s
-      console.error(`AniList request failed on page ${page}: HTTP ${res.status} (attempt ${attempt}/${maxAttempts}) — retrying in ${waitMs / 1000}s...`);
-      await new Promise((r) => setTimeout(r, waitMs));
-      continue;
-    }
 
-    console.error(`AniList request failed on page ${page}: HTTP ${res.status} (attempt ${attempt}/${maxAttempts}) — giving up on this page.`);
-    return res;
+function getImage(anime) {
+  return (
+    anime?.coverImage?.extraLarge ||
+    anime?.coverImage?.large ||
+    anime?.coverImage?.medium ||
+    ''
+  );
+}
+
+
+function getStudio(anime) {
+  return (
+    (anime?.studios?.nodes || [])
+      .map((studio) => studio?.name)
+      .filter(Boolean)
+      .join(', ') ||
+    'Unknown Studio'
+  );
+}
+
+
+function getYear(anime) {
+  return anime?.startDate?.year || 'N/A';
+}
+
+
+function getScore(anime) {
+  if (
+    anime?.averageScore === null ||
+    anime?.averageScore === undefined
+  ) {
+    return '—';
   }
+
+  const score = Number(anime.averageScore);
+
+  if (!Number.isFinite(score)) {
+    return '—';
+  }
+
+  return (score / 10).toFixed(1);
 }
 
-async function fetchAllAnime() {
+
+function getEpisodes(anime) {
+  return anime?.episodes || '—';
+}
+
+
+function getGenres(anime) {
+  return Array.isArray(anime?.genres)
+    ? anime.genres.filter(Boolean)
+    : [];
+}
+
+
+function getStatusText(status) {
+  const map = {
+    FINISHED: 'Finished',
+    RELEASING: 'Currently Airing',
+    NOT_YET_RELEASED: 'Not Yet Released',
+    CANCELLED: 'Cancelled',
+    HIATUS: 'On Hiatus',
+  };
+
+  return map[status] || 'Unknown';
+}
+
+
+// ============================================================
+// ANILIST FETCH
+// ============================================================
+
+async function fetchAniListPage(page, maxAttempts = 3) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      console.log(
+        `AniList: fetching page ${page} ` +
+        `(attempt ${attempt}/${maxAttempts})...`
+      );
+
+      const response = await fetch(ANILIST_API, {
+        method: 'POST',
+        headers: REQUEST_HEADERS,
+        body: JSON.stringify({
+          query: ANILIST_QUERY,
+          variables: {
+            page,
+            perPage: ANILIST_PER_PAGE,
+          },
+        }),
+      });
+
+
+      // --------------------------------------------------------
+      // SUCCESS
+      // --------------------------------------------------------
+
+      if (response.ok) {
+        let json;
+
+        try {
+          json = await response.json();
+        } catch (error) {
+          console.error(
+            'AniList returned invalid JSON:',
+            error?.message || error
+          );
+
+          if (attempt < maxAttempts) {
+            await sleep(5000 * attempt);
+            continue;
+          }
+
+          return null;
+        }
+
+
+        // ------------------------------------------------------
+        // GRAPHQL ERRORS
+        // ------------------------------------------------------
+
+        if (Array.isArray(json?.errors) && json.errors.length > 0) {
+          console.error(
+            'AniList GraphQL error:',
+            JSON.stringify(json.errors, null, 2)
+          );
+
+          return null;
+        }
+
+
+        return json?.data?.Page || null;
+      }
+
+
+      // --------------------------------------------------------
+      // HTTP ERROR
+      // --------------------------------------------------------
+
+      const status = response.status;
+
+      let body = '';
+
+      try {
+        body = await response.text();
+      } catch {
+        body = '';
+      }
+
+
+      console.error(
+        `AniList HTTP ${status} on page ${page} ` +
+        `(attempt ${attempt}/${maxAttempts})`
+      );
+
+
+      if (body) {
+        console.error(
+          `AniList response: ${body.slice(0, 800)}`
+        );
+      }
+
+
+      // --------------------------------------------------------
+      // 403
+      // DO NOT WASTE RETRIES
+      // --------------------------------------------------------
+
+      if (status === 403) {
+        console.error(
+          'AniList returned HTTP 403. ' +
+          'The GitHub Actions runner may be blocked/restricted. ' +
+          'Switching to Jikan fallback.'
+        );
+
+        return null;
+      }
+
+
+      // --------------------------------------------------------
+      // RETRYABLE
+      // --------------------------------------------------------
+
+      const retryable =
+        status === 429 ||
+        status === 408 ||
+        status >= 500;
+
+
+      if (retryable && attempt < maxAttempts) {
+        const retryAfterHeader =
+          response.headers.get('retry-after');
+
+        const retryAfterSeconds =
+          Number(retryAfterHeader);
+
+        const waitMs =
+          Number.isFinite(retryAfterSeconds) &&
+          retryAfterSeconds > 0
+            ? retryAfterSeconds * 1000
+            : 5000 * attempt;
+
+
+        console.log(
+          `AniList temporary error. ` +
+          `Retrying in ${Math.ceil(waitMs / 1000)} seconds...`
+        );
+
+        await sleep(waitMs);
+        continue;
+      }
+
+
+      return null;
+
+    } catch (error) {
+      console.error(
+        `AniList network error on page ${page}:`,
+        error?.message || error
+      );
+
+
+      if (attempt < maxAttempts) {
+        const waitMs = 5000 * attempt;
+
+        console.log(
+          `Retrying AniList in ` +
+          `${Math.ceil(waitMs / 1000)} seconds...`
+        );
+
+        await sleep(waitMs);
+        continue;
+      }
+
+
+      return null;
+    }
+  }
+
+
+  return null;
+}
+
+
+// ============================================================
+// FETCH ALL FROM ANILIST
+// ============================================================
+
+async function fetchFromAniList() {
   const all = [];
   const seen = new Set();
-  for (let page = 1; page <= PAGE_COUNT; page++) {
-    const res = await fetchPageWithRetry(page);
-    if (!res || !res.ok) {
+
+
+  for (
+    let page = 1;
+    page <= ANILIST_MAX_PAGES;
+    page++
+  ) {
+    const pageData =
+      await fetchAniListPage(page);
+
+
+    if (!pageData) {
+      console.error(
+        `AniList failed on page ${page}.`
+      );
+
+      return [];
+    }
+
+
+    const media =
+      Array.isArray(pageData.media)
+        ? pageData.media
+        : [];
+
+
+    if (media.length === 0) {
+      console.error(
+        `AniList returned 0 anime on page ${page}.`
+      );
+
       break;
     }
-    const json = await res.json();
-    const media = json?.data?.Page?.media || [];
-    if (media.length === 0) break;
-    for (const m of media) {
-      if (!seen.has(m.id)) {
-        seen.add(m.id);
-        all.push(m);
+
+
+    for (const anime of media) {
+      if (!anime?.id) {
+        continue;
+      }
+
+      if (seen.has(anime.id)) {
+        continue;
+      }
+
+      seen.add(anime.id);
+      all.push(anime);
+
+
+      if (all.length >= TARGET_COUNT) {
+        break;
       }
     }
-    // AniList free API: be polite between calls.
-    await new Promise((r) => setTimeout(r, 700));
+
+
+    console.log(
+      `AniList: collected ${all.length}/${TARGET_COUNT}`
+    );
+
+
+    if (all.length >= TARGET_COUNT) {
+      break;
+    }
+
+
+    if (pageData.pageInfo?.hasNextPage === false) {
+      break;
+    }
+
+
+    await sleep(1500);
   }
-  return all;
+
+
+  return all.slice(0, TARGET_COUNT);
 }
 
-// Har page ke liye thoda "apna" unique text banata hai (AniList ke raw
-// description ke alawa) — isse Google ko duplicate-content nahi lagta,
-// kyunki ye text sirf is site par hai aur data ke hisaab se generate hota hai.
-function buildEditorNote(m, title, genres, studio, year, score) {
-  const genreList = genres.length ? genres.slice(0, 3).join(', ') : 'multiple genres';
-  const scoreLine = m.averageScore != null
-    ? (m.averageScore >= 75
-        ? `holds a strong community score of ${score}/10`
-        : m.averageScore >= 50
-          ? `sits at a solid ${score}/10 with viewers`
-          : `has a score of ${score}/10 on AniList`)
-    : 'has not yet accumulated enough ratings for a community score';
+
+// ============================================================
+// NORMALIZE JIKAN DATA
+// ============================================================
+
+function normalizeJikanAnime(item) {
+  if (!item?.mal_id) {
+    return null;
+  }
+
+
+  const title =
+    item.title ||
+    item.title_english ||
+    item.title_japanese ||
+    'Untitled Anime';
+
+
+  const description =
+    item.synopsis ||
+    item.background ||
+    'No synopsis available.';
+
+
+  const year =
+    item.year ||
+    item.aired?.prop?.from?.year ||
+    'N/A';
+
+
+  const image =
+    item.images?.jpg?.large_image_url ||
+    item.images?.jpg?.image_url ||
+    item.images?.webp?.large_image_url ||
+    item.images?.webp?.image_url ||
+    '';
+
+
+  const score =
+    item.score !== null &&
+    item.score !== undefined
+      ? Number(item.score)
+      : null;
+
+
+  const genres = [
+    ...(item.genres || []),
+    ...(item.themes || []),
+  ]
+    .map((genre) => genre?.name)
+    .filter(Boolean);
+
+
+  return {
+    id: `mal-${item.mal_id}`,
+
+    sourceId: item.mal_id,
+
+    source: 'Jikan',
+
+    title: {
+      romaji: title,
+      english:
+        item.title_english ||
+        title,
+      native:
+        item.title_japanese ||
+        title,
+    },
+
+    coverImage: {
+      extraLarge: image,
+      large: image,
+      medium: image,
+    },
+
+    bannerImage: '',
+
+    averageScore: score !== null
+      ? score * 10
+      : null,
+
+    episodes:
+      item.episodes ||
+      null,
+
+    format:
+      item.type ||
+      'TV',
+
+    status:
+      item.status === 'Currently Airing'
+        ? 'RELEASING'
+        : item.status === 'Finished Airing'
+          ? 'FINISHED'
+          : 'UNKNOWN',
+
+    genres,
+
+    description,
+
+    startDate: {
+      year,
+      month:
+        item.aired?.prop?.from?.month ||
+        null,
+      day:
+        item.aired?.prop?.from?.day ||
+        null,
+    },
+
+    studios: {
+      nodes:
+        (item.studios || [])
+          .map((studio) => ({
+            name: studio?.name,
+          }))
+          .filter((studio) => studio.name),
+    },
+  };
+}
+
+
+// ============================================================
+// JIKAN FETCH
+// ============================================================
+
+async function fetchJikanPage(
+  page,
+  maxAttempts = 4
+) {
+  const url =
+    `${JIKAN_API}?page=${page}&limit=${JIKAN_PER_PAGE}`;
+
+
+  for (
+    let attempt = 1;
+    attempt <= maxAttempts;
+    attempt++
+  ) {
+    try {
+      console.log(
+        `Jikan: fetching page ${page} ` +
+        `(attempt ${attempt}/${maxAttempts})...`
+      );
+
+
+      const response = await fetch(url, {
+        method: 'GET',
+        headers: {
+          Accept: 'application/json',
+          'User-Agent':
+            'BOSS-Anime-Club-SEO-Generator/1.0',
+        },
+      });
+
+
+      if (response.ok) {
+        const json = await response.json();
+
+        return json;
+      }
+
+
+      const status = response.status;
+
+
+      console.error(
+        `Jikan HTTP ${status} on page ${page}`
+      );
+
+
+      if (
+        status === 429 ||
+        status === 408 ||
+        status >= 500
+      ) {
+        if (attempt < maxAttempts) {
+          const waitMs =
+            status === 429
+              ? 10000
+              : 5000 * attempt;
+
+
+          console.log(
+            `Jikan retrying in ` +
+            `${Math.ceil(waitMs / 1000)} seconds...`
+          );
+
+
+          await sleep(waitMs);
+          continue;
+        }
+      }
+
+
+      return null;
+
+    } catch (error) {
+      console.error(
+        `Jikan network error on page ${page}:`,
+        error?.message || error
+      );
+
+
+      if (attempt < maxAttempts) {
+        const waitMs = 5000 * attempt;
+
+        await sleep(waitMs);
+        continue;
+      }
+
+
+      return null;
+    }
+  }
+
+
+  return null;
+}
+
+
+// ============================================================
+// FETCH ALL FROM JIKAN
+// ============================================================
+
+async function fetchFromJikan() {
+  const all = [];
+  const seen = new Set();
+
+
+  for (
+    let page = 1;
+    page <= JIKAN_MAX_PAGES;
+    page++
+  ) {
+    const json =
+      await fetchJikanPage(page);
+
+
+    if (!json) {
+      console.error(
+        `Jikan failed on page ${page}.`
+      );
+
+      return [];
+    }
+
+
+    const data =
+      Array.isArray(json.data)
+        ? json.data
+        : [];
+
+
+    if (data.length === 0) {
+      console.error(
+        `Jikan returned 0 anime on page ${page}.`
+      );
+
+      break;
+    }
+
+
+    for (const item of data) {
+      const anime =
+        normalizeJikanAnime(item);
+
+
+      if (!anime) {
+        continue;
+      }
+
+
+      if (seen.has(anime.id)) {
+        continue;
+      }
+
+
+      seen.add(anime.id);
+      all.push(anime);
+
+
+      if (all.length >= TARGET_COUNT) {
+        break;
+      }
+    }
+
+
+    console.log(
+      `Jikan: collected ${all.length}/${TARGET_COUNT}`
+    );
+
+
+    if (all.length >= TARGET_COUNT) {
+      break;
+    }
+
+
+    await sleep(1500);
+  }
+
+
+  return all.slice(0, TARGET_COUNT);
+}
+
+
+// ============================================================
+// MAIN API SELECTOR
+// ============================================================
+
+async function fetchAllAnime() {
+  console.log('');
+  console.log('==========================================');
+  console.log(' BOSS Anime Club SEO Generator');
+  console.log('==========================================');
+  console.log('');
+
+
+  // ----------------------------------------------------------
+  // TRY ANILIST FIRST
+  // ----------------------------------------------------------
+
+  console.log(
+    'Primary source: AniList'
+  );
+
+
+  const aniListAnime =
+    await fetchFromAniList();
+
+
+  if (aniListAnime.length > 0) {
+    console.log('');
+    console.log(
+      `SUCCESS: AniList returned ` +
+      `${aniListAnime.length} anime.`
+    );
+    console.log('');
+
+    return {
+      anime: aniListAnime,
+      source: 'AniList',
+    };
+  }
+
+
+  // ----------------------------------------------------------
+  // FALLBACK
+  // ----------------------------------------------------------
+
+  console.log('');
+  console.log(
+    'AniList unavailable. Using Jikan fallback...'
+  );
+  console.log('');
+
+
+  const jikanAnime =
+    await fetchFromJikan();
+
+
+  if (jikanAnime.length > 0) {
+    console.log('');
+    console.log(
+      `SUCCESS: Jikan returned ` +
+      `${jikanAnime.length} anime.`
+    );
+    console.log('');
+
+    return {
+      anime: jikanAnime,
+      source: 'Jikan',
+    };
+  }
+
+
+  // ----------------------------------------------------------
+  // EVERYTHING FAILED
+  // ----------------------------------------------------------
+
+  console.error('');
+  console.error(
+    'ERROR: Both AniList and Jikan returned 0 anime.'
+  );
+  console.error(
+    'SAFETY MODE: No files will be deleted or overwritten.'
+  );
+  console.error('');
+
+
+  return {
+    anime: [],
+    source: null,
+  };
+}
+
+
+// ============================================================
+// EDITOR NOTE
+// ============================================================
+
+function buildEditorNote(
+  anime,
+  title,
+  genres,
+  studio,
+  year,
+  score
+) {
+  const genreList =
+    genres.length > 0
+      ? genres.slice(0, 3).join(', ')
+      : 'multiple genres';
+
+
+  let scoreLine =
+    'does not currently have a community score';
+
+
+  if (
+    anime.averageScore !== null &&
+    anime.averageScore !== undefined
+  ) {
+    const numericScore =
+      Number(score);
+
+
+    if (numericScore >= 7.5) {
+      scoreLine =
+        `holds a strong community score of ${score}/10`;
+    } else if (numericScore >= 5) {
+      scoreLine =
+        `has a solid community score of ${score}/10`;
+    } else {
+      scoreLine =
+        `has a community score of ${score}/10`;
+    }
+  }
+
+
   const statusLine = {
-    FINISHED: 'The series has completed its run',
-    RELEASING: 'New episodes are currently airing',
-    NOT_YET_RELEASED: 'The series has not yet premiered',
-    CANCELLED: 'The series was cancelled before completion',
-    HIATUS: 'The series is currently on hiatus',
-  }[m.status] || 'Current airing status is being tracked';
+    FINISHED:
+      'The series has completed its run',
 
-  return `On BOSS Anime Club, ${esc(title)} is filed under ${esc(genreList)} and ${scoreLine}. `
-    + `${statusLine}, and it was produced by ${esc(studio)}${year !== 'N/A' ? ` starting in ${esc(String(year))}` : ''}. `
-    + `Save this page to your BOSS Anime Club playlist to track episodes and get English or Hindi narration for the synopsis.`;
+    RELEASING:
+      'New episodes are currently airing',
+
+    NOT_YET_RELEASED:
+      'The series has not yet premiered',
+
+    CANCELLED:
+      'The series was cancelled before completion',
+
+    HIATUS:
+      'The series is currently on hiatus',
+
+  }[anime.status] ||
+    'Its current airing status is being tracked';
+
+
+  const studioText =
+    studio || 'an unknown studio';
+
+
+  const yearText =
+    year !== 'N/A'
+      ? ` starting in ${year}`
+      : '';
+
+
+  return (
+    `On BOSS Anime Club, ${title} is filed under ` +
+    `${genreList} and ${scoreLine}. ` +
+    `${statusLine}, and it was produced by ` +
+    `${studioText}${yearText}. ` +
+    `Use this page to explore the anime information, ` +
+    `episode details, genres and synopsis.`
+  );
 }
 
-function pageHTML(m) {
-  const title = m.title?.english || m.title?.romaji || m.title?.native || 'Untitled';
-  const img = m.coverImage?.extraLarge || m.coverImage?.large || '';
-  const synopsis = (m.description || '').replace(/<br\s*\/?>/gi, ' ').replace(/<[^>]+>/g, '').slice(0, 300);
-  const genres = m.genres || [];
-  const studio = (m.studios?.nodes || []).map((s) => s.name).join(', ') || 'Unknown';
-  const year = m.startDate?.year || 'N/A';
-  const score = m.averageScore != null ? (m.averageScore / 10).toFixed(1) : '—';
-  const episodes = m.episodes || '—';
-  const url = `${SITE_URL}/anime/${slugify(title)}-${m.id}.html`;
-  const editorNote = buildEditorNote(m, title, genres, studio, year, score);
-  // Speech synthesis reads this: synopsis + editor note, stripped of markup.
-  const speakText = `${synopsis} ${editorNote}`.replace(/<[^>]+>/g, '');
 
-  const jsonLd = {
+// ============================================================
+// JSON-LD
+// ============================================================
+
+function buildJsonLd({
+  title,
+  img,
+  synopsis,
+  genres,
+  year,
+  episodes,
+  url,
+}) {
+  const data = {
     '@context': 'https://schema.org',
     '@type': 'TVSeries',
     name: title,
-    image: img,
     description: synopsis,
     genre: genres,
-    datePublished: m.startDate?.year ? String(m.startDate.year) : undefined,
-    numberOfEpisodes: m.episodes || undefined,
+    url,
   };
 
+
+  if (img) {
+    data.image = [img];
+  }
+
+
+  if (year !== 'N/A') {
+    data.datePublished = String(year);
+  }
+
+
+  if (
+    episodes !== '—' &&
+    Number.isFinite(Number(episodes))
+  ) {
+    data.numberOfEpisodes =
+      Number(episodes);
+  }
+
+
+  return JSON.stringify(data)
+    .replace(/</g, '\\u003c')
+    .replace(/>/g, '\\u003e')
+    .replace(/&/g, '\\u0026');
+}
+
+
+// ============================================================
+// INDIVIDUAL PAGE HTML
+// ============================================================
+
+function pageHTML(anime) {
+  const title =
+    getTitle(anime);
+
+
+  const img =
+    getImage(anime);
+
+
+  const synopsis =
+    truncate(
+      stripHtml(anime.description),
+      500
+    );
+
+
+  const genres =
+    getGenres(anime);
+
+
+  const studio =
+    getStudio(anime);
+
+
+  const year =
+    getYear(anime);
+
+
+  const score =
+    getScore(anime);
+
+
+  const episodes =
+    getEpisodes(anime);
+
+
+  const status =
+    getStatusText(anime.status);
+
+
+  const slug =
+    slugify(title);
+
+
+  const url =
+    `${SITE_URL}/anime/${slug}-${anime.id}.html`;
+
+
+  const editorNote =
+    buildEditorNote(
+      anime,
+      title,
+      genres,
+      studio,
+      year,
+      score
+    );
+
+
+  const speakText =
+    `${title}. ${synopsis}. ${editorNote}`;
+
+
+  const jsonLd =
+    buildJsonLd({
+      title,
+      img,
+      synopsis,
+      genres,
+      year,
+      episodes,
+      url,
+    });
+
+
   return `<!DOCTYPE html>
 <html lang="en">
+
 <head>
+
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>${esc(title)} &mdash; Watch Guide, Info &amp; Episodes | BOSS Anime Club</title>
-<meta name="description" content="${esc(title)} (${esc(year)}) &mdash; ${esc(synopsis.slice(0, 150))}">
-<link rel="canonical" href="${url}">
-<meta property="og:title" content="${esc(title)} &mdash; BOSS Anime Club">
-<meta property="og:description" content="${esc(synopsis.slice(0, 200))}">
-<meta property="og:image" content="${esc(img)}">
-<meta property="og:type" content="video.tv_show">
-<meta property="og:url" content="${url}">
-<meta name="twitter:card" content="summary_large_image">
-<meta name="twitter:title" content="${esc(title)} &mdash; BOSS Anime Club">
-<meta name="twitter:description" content="${esc(synopsis.slice(0, 200))}">
-<meta name="twitter:image" content="${esc(img)}">
-<script type="application/ld+json">${JSON.stringify(jsonLd)}</script>
+
+<meta
+  name="viewport"
+  content="width=device-width, initial-scale=1.0"
+>
+
+<title>
+${esc(title)} &mdash; Watch Guide, Info &amp; Episodes | BOSS Anime Club
+</title>
+
+<meta
+  name="description"
+  content="${escapeAttr(
+    `${title} (${year}) — ${truncate(synopsis, 150)}`
+  )}"
+>
+
+<link
+  rel="canonical"
+  href="${escapeAttr(url)}"
+>
+
+<meta
+  property="og:title"
+  content="${escapeAttr(
+    `${title} — BOSS Anime Club`
+  )}"
+>
+
+<meta
+  property="og:description"
+  content="${escapeAttr(
+    truncate(synopsis, 200)
+  )}"
+>
+
+<meta
+  property="og:image"
+  content="${escapeAttr(img)}"
+>
+
+<meta
+  property="og:type"
+  content="video.tv_show"
+>
+
+<meta
+  property="og:url"
+  content="${escapeAttr(url)}"
+>
+
+<meta
+  name="twitter:card"
+  content="summary_large_image"
+>
+
+<meta
+  name="twitter:title"
+  content="${escapeAttr(
+    `${title} — BOSS Anime Club`
+  )}"
+>
+
+<meta
+  name="twitter:description"
+  content="${escapeAttr(
+    truncate(synopsis, 200)
+  )}"
+>
+
+<meta
+  name="twitter:image"
+  content="${escapeAttr(img)}"
+>
+
+<script type="application/ld+json">${jsonLd}</script>
+
 ${ANALYTICS_SCRIPT}
+
 <style>
-  body{background:#0E1116;color:#F4F1EA;font-family:sans-serif;max-width:720px;margin:0 auto;padding:24px 16px 60px;line-height:1.6;}
-  a{color:#FFB454;}
-  img{max-width:220px;border-radius:4px;display:block;margin-bottom:16px;}
-  .tag{display:inline-block;font-size:12px;border:1px solid #2A3140;border-radius:2px;padding:2px 8px;margin:2px 4px 2px 0;color:#8B93A7;}
-  .meta{font-size:14px;color:#8B93A7;margin-bottom:16px;}
-  .editor-note{border-left:2px solid #FFB454;padding:10px 14px;margin:20px 0;background:#171B24;font-size:14px;color:#F4F1EA;}
-  .backlink{margin-top:32px;display:block;}
-  .listen-btn{
-    font-family:inherit;font-size:13px;letter-spacing:0.3px;text-transform:uppercase;
-    background:#171B24;border:1px solid #5B8DEF;color:#F4F1EA;padding:9px 16px;
-    border-radius:6px;cursor:pointer;display:inline-flex;align-items:center;gap:6px;margin:16px 0;
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  background: #0E1116;
+  color: #F4F1EA;
+  font-family:
+    system-ui,
+    -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    sans-serif;
+
+  max-width: 760px;
+  margin: 0 auto;
+
+  padding:
+    24px
+    16px
+    70px;
+
+  line-height: 1.65;
+}
+
+a {
+  color: #FFB454;
+}
+
+a:hover {
+  color: #FFD08A;
+}
+
+h1 {
+  line-height: 1.2;
+  margin-bottom: 20px;
+}
+
+.cover {
+  width: 220px;
+  max-width: 100%;
+
+  border-radius: 8px;
+
+  display: block;
+
+  margin-bottom: 20px;
+
+  background: #171B24;
+}
+
+.meta {
+  font-size: 14px;
+  color: #8B93A7;
+
+  margin-bottom: 18px;
+}
+
+.tag {
+  display: inline-block;
+
+  font-size: 12px;
+
+  border:
+    1px solid
+    #2A3140;
+
+  border-radius: 4px;
+
+  padding:
+    3px
+    9px;
+
+  margin:
+    2px
+    4px
+    2px
+    0;
+
+  color: #AAB2C3;
+
+  background: #11151D;
+}
+
+.synopsis {
+  margin-top: 22px;
+}
+
+.editor-note {
+  border-left:
+    3px solid
+    #FFB454;
+
+  padding:
+    12px
+    15px;
+
+  margin:
+    24px
+    0;
+
+  background: #171B24;
+
+  font-size: 14px;
+
+  color: #E7E3DA;
+
+  border-radius: 0 6px 6px 0;
+}
+
+.listen-row {
+  margin:
+    24px
+    0;
+}
+
+.listen-btn {
+  font-family: inherit;
+
+  font-size: 13px;
+
+  letter-spacing:
+    0.3px;
+
+  text-transform:
+    uppercase;
+
+  background:
+    #171B24;
+
+  border:
+    1px solid
+    #5B8DEF;
+
+  color:
+    #F4F1EA;
+
+  padding:
+    10px
+    16px;
+
+  border-radius:
+    6px;
+
+  cursor:
+    pointer;
+
+  display:
+    inline-flex;
+
+  align-items:
+    center;
+
+  gap:
+    7px;
+}
+
+.listen-btn:hover {
+  border-color:
+    #6FA3FF;
+
+  color:
+    #9FC1FF;
+}
+
+.listen-btn:disabled {
+  opacity:
+    0.5;
+
+  cursor:
+    default;
+}
+
+.listen-status {
+  font-size:
+    12px;
+
+  color:
+    #8B93A7;
+
+  margin-left:
+    8px;
+}
+
+.backlink {
+  margin-top:
+    18px;
+
+  display:
+    block;
+
+  text-decoration:
+    none;
+}
+
+.footer {
+  margin-top:
+    40px;
+
+  padding-top:
+    20px;
+
+  border-top:
+    1px solid
+    #222936;
+
+  font-size:
+    12px;
+
+  color:
+    #70798D;
+}
+
+@media (max-width: 600px) {
+
+  body {
+    padding:
+      20px
+      14px
+      50px;
   }
-  .listen-btn:hover{border-color:#6FA3FF;color:#9FC1FF;}
-  .listen-btn:disabled{opacity:0.5;cursor:default;}
-  .listen-status{font-size:12px;color:#8B93A7;margin-left:8px;}
+
+  h1 {
+    font-size:
+      28px;
+  }
+
+  .cover {
+    width:
+      180px;
+  }
+
+}
+
 </style>
+
 </head>
+
 <body>
-<h1>${esc(title)}</h1>
-<img src="${esc(img)}" alt="${esc(title)} cover" loading="lazy">
-<div class="meta">Score: ${esc(score)}/10 &nbsp;&middot;&nbsp; Episodes: ${esc(episodes)} &nbsp;&middot;&nbsp; Year: ${esc(year)} &nbsp;&middot;&nbsp; Studio: ${esc(studio)}</div>
-<div>${genres.map((g) => `<span class="tag">${esc(g)}</span>`).join('')}</div>
-<p>${esc(synopsis) || 'No synopsis available.'}</p>
-<div class="editor-note">${editorNote}</div>
 
-<button class="listen-btn" id="listenBtn" type="button">&#128266; Listen (device voice)</button>
-<span class="listen-status" id="listenStatus"></span>
+<main>
 
-<a class="backlink" href="${SITE_URL}/">&#9656; Open in the BOSS Anime Club app to search, save playlists, and listen to narration</a>
-<a class="backlink" href="${SITE_URL}/anime/index.html">&#9656; Browse all anime</a>
+<h1>
+${esc(title)}
+</h1>
+
+${
+  img
+    ? `
+<img
+  class="cover"
+  src="${escapeAttr(img)}"
+  alt="${escapeAttr(title)} cover"
+  loading="lazy"
+  decoding="async"
+>
+`
+    : ''
+}
+
+<div class="meta">
+
+<strong>Score:</strong>
+${esc(score)}/10
+
+&nbsp;&middot;&nbsp;
+
+<strong>Episodes:</strong>
+${esc(episodes)}
+
+&nbsp;&middot;&nbsp;
+
+<strong>Year:</strong>
+${esc(year)}
+
+&nbsp;&middot;&nbsp;
+
+<strong>Status:</strong>
+${esc(status)}
+
+&nbsp;&middot;&nbsp;
+
+<strong>Studio:</strong>
+${esc(studio)}
+
+</div>
+
+<div>
+
+${
+  genres
+    .map(
+      (genre) =>
+        `<span class="tag">${esc(genre)}</span>`
+    )
+    .join('')
+}
+
+</div>
+
+<section class="synopsis">
+
+<h2>
+Synopsis
+</h2>
+
+<p>
+${
+  esc(synopsis) ||
+  'No synopsis available.'
+}
+</p>
+
+</section>
+
+<section class="editor-note">
+
+<strong>
+BOSS Anime Club Note
+</strong>
+
+<br>
+
+${esc(editorNote)}
+
+</section>
+
+<div class="listen-row">
+
+<button
+  class="listen-btn"
+  id="listenBtn"
+  type="button"
+>
+&#128266; Listen
+</button>
+
+<span
+  class="listen-status"
+  id="listenStatus"
+></span>
+
+</div>
+
+<a
+  class="backlink"
+  href="${SITE_URL}/"
+>
+&#9656; Open BOSS Anime Club
+</a>
+
+<a
+  class="backlink"
+  href="${SITE_URL}/anime/index.html"
+>
+&#9656; Browse all anime
+</a>
+
+<div class="footer">
+
+BOSS Anime Club &mdash;
+Anime information, guides and episode details.
+
+</div>
+
+</main>
+
 
 <script>
-(function(){
-  var btn = document.getElementById('listenBtn');
-  var status = document.getElementById('listenStatus');
-  var text = ${JSON.stringify(speakText)};
-  var LABEL_LISTEN = '\\uD83D\\uDD0A Listen (device voice)';
-  var LABEL_STOP = '\\u23F9 Stop';
-  if(!('speechSynthesis' in window)){
+
+(function () {
+
+  var btn =
+    document.getElementById('listenBtn');
+
+  var status =
+    document.getElementById('listenStatus');
+
+  var text =
+    ${JSON.stringify(speakText)};
+
+
+  var LABEL_LISTEN =
+    '\\uD83D\\uDD0A Listen';
+
+  var LABEL_STOP =
+    '\\u23F9 Stop';
+
+
+  if (
+    !('speechSynthesis' in window) ||
+    !('SpeechSynthesisUtterance' in window)
+  ) {
+
     btn.disabled = true;
-    status.textContent = 'Not supported on this browser/device.';
+
+    status.textContent =
+      'Not supported on this browser/device.';
+
     return;
+
   }
+
+
   var speaking = false;
-  btn.addEventListener('click', function(){
-    if(speaking){
+
+
+  btn.addEventListener(
+    'click',
+    function () {
+
+      if (speaking) {
+
+        window.speechSynthesis.cancel();
+
+        speaking = false;
+
+        btn.textContent =
+          LABEL_LISTEN;
+
+        status.textContent =
+          '';
+
+        return;
+
+      }
+
+
       window.speechSynthesis.cancel();
-      speaking = false;
-      btn.textContent = LABEL_LISTEN;
-      status.textContent = '';
-      return;
+
+
+      var utter =
+        new SpeechSynthesisUtterance(text);
+
+
+      utter.lang =
+        'en-US';
+
+      utter.rate =
+        0.95;
+
+      utter.pitch =
+        1;
+
+
+      utter.onstart =
+        function () {
+
+          speaking = true;
+
+          btn.textContent =
+            LABEL_STOP;
+
+          status.textContent =
+            'Playing...';
+
+        };
+
+
+      utter.onend =
+        function () {
+
+          speaking = false;
+
+          btn.textContent =
+            LABEL_LISTEN;
+
+          status.textContent =
+            '';
+
+        };
+
+
+      utter.onerror =
+        function () {
+
+          speaking = false;
+
+          btn.textContent =
+            LABEL_LISTEN;
+
+          status.textContent =
+            'Could not play audio.';
+
+        };
+
+
+      window.speechSynthesis.speak(
+        utter
+      );
+
     }
-    window.speechSynthesis.cancel();
-    var utter = new SpeechSynthesisUtterance(text);
-    utter.lang = 'en-US';
-    utter.onstart = function(){ speaking = true; btn.textContent = LABEL_STOP; status.textContent = 'Playing...'; };
-    utter.onend = function(){ speaking = false; btn.textContent = LABEL_LISTEN; status.textContent = ''; };
-    utter.onerror = function(){ speaking = false; btn.textContent = LABEL_LISTEN; status.textContent = 'Could not play audio.'; };
-    window.speechSynthesis.speak(utter);
-  });
+  );
+
+
 })();
+
 </script>
+
 </body>
+
 </html>`;
 }
 
-function indexHTML(list) {
-  const rows = list
-    .map((m) => {
-      const title = m.title?.english || m.title?.romaji || 'Untitled';
-      const slug = slugify(title);
-      return `<li><a href="./${slug}-${m.id}.html">${esc(title)}</a></li>`;
-    })
-    .join('\n');
+
+// ============================================================
+// INDEX HTML
+// ============================================================
+
+function indexHTML(list, source) {
+  const rows =
+    list
+      .map((anime) => {
+
+        const title =
+          getTitle(anime);
+
+        const slug =
+          slugify(title);
+
+        const href =
+          `./${slug}-${anime.id}.html`;
+
+
+        return `
+<li>
+  <a href="${escapeAttr(href)}">
+    ${esc(title)}
+  </a>
+</li>`;
+
+      })
+      .join('\n');
+
+
   return `<!DOCTYPE html>
+
 <html lang="en">
+
 <head>
+
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Browse All Anime | BOSS Anime Club</title>
-<meta name="description" content="Browse the full list of anime on BOSS Anime Club &mdash; info, episodes, genres and more.">
-<link rel="canonical" href="${SITE_URL}/anime/index.html">
+
+<meta
+  name="viewport"
+  content="width=device-width, initial-scale=1.0"
+>
+
+<title>
+Browse All Anime | BOSS Anime Club
+</title>
+
+<meta
+  name="description"
+  content="Browse anime on BOSS Anime Club — anime information, episodes, genres, scores and more."
+>
+
+<link
+  rel="canonical"
+  href="${SITE_URL}/anime/index.html"
+>
+
 ${ANALYTICS_SCRIPT}
+
 <style>
-  body{background:#0E1116;color:#F4F1EA;font-family:sans-serif;max-width:720px;margin:0 auto;padding:24px 16px 60px;}
-  a{color:#FFB454;text-decoration:none;}
-  li{margin-bottom:8px;}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+
+  background:
+    #0E1116;
+
+  color:
+    #F4F1EA;
+
+  font-family:
+    system-ui,
+    -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    sans-serif;
+
+  max-width:
+    760px;
+
+  margin:
+    0 auto;
+
+  padding:
+    24px
+    16px
+    60px;
+
+  line-height:
+    1.6;
+}
+
+a {
+  color:
+    #FFB454;
+
+  text-decoration:
+    none;
+}
+
+a:hover {
+  color:
+    #FFD08A;
+}
+
+li {
+  margin-bottom:
+    9px;
+}
+
+.header {
+  margin-bottom:
+    25px;
+}
+
+.count {
+  color:
+    #8B93A7;
+
+  font-size:
+    14px;
+}
+
+.source {
+  color:
+    #70798D;
+
+  font-size:
+    12px;
+}
+
 </style>
+
 </head>
+
 <body>
-<h1>Browse All Anime</h1>
-<p><a href="${SITE_URL}/">&larr; Back to BOSS Anime Club</a></p>
+
+<header class="header">
+
+<h1>
+Browse All Anime
+</h1>
+
+<p class="count">
+${list.length} anime available.
+</p>
+
+<p class="source">
+Data source: ${esc(source)}
+</p>
+
+<p>
+<a href="${SITE_URL}/">
+&larr; Back to BOSS Anime Club
+</a>
+</p>
+
+</header>
+
 <ul>
+
 ${rows}
+
 </ul>
+
 </body>
+
 </html>`;
 }
+
+
+// ============================================================
+// SITEMAP
+// ============================================================
 
 function sitemapXML(list) {
-  const today = new Date().toISOString().slice(0, 10); // e.g. "2026-08-31"
-  const urls = list
-    .map((m) => {
-      const title = m.title?.english || m.title?.romaji || 'Untitled';
-      const slug = slugify(title);
-      return `  <url><loc>${SITE_URL}/anime/${slug}-${m.id}.html</loc><lastmod>${today}</lastmod></url>`;
-    })
-    .join('\n');
+  const today =
+    new Date()
+      .toISOString()
+      .slice(0, 10);
+
+
+  const urls =
+    list
+      .map((anime) => {
+
+        const title =
+          getTitle(anime);
+
+        const slug =
+          slugify(title);
+
+        const url =
+          `${SITE_URL}/anime/${slug}-${anime.id}.html`;
+
+
+        return `  <url>
+    <loc>${esc(url)}</loc>
+    <lastmod>${today}</lastmod>
+  </url>`;
+
+      })
+      .join('\n');
+
+
   return `<?xml version="1.0" encoding="UTF-8"?>
-<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
-  <url><loc>${SITE_URL}/</loc><priority>1.0</priority><lastmod>${today}</lastmod></url>
-  <url><loc>${SITE_URL}/anime/index.html</loc><priority>0.8</priority><lastmod>${today}</lastmod></url>
+
+<urlset
+  xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"
+>
+
+  <url>
+    <loc>${SITE_URL}/</loc>
+    <priority>1.0</priority>
+    <lastmod>${today}</lastmod>
+  </url>
+
+  <url>
+    <loc>${SITE_URL}/anime/index.html</loc>
+    <priority>0.8</priority>
+    <lastmod>${today}</lastmod>
+  </url>
+
 ${urls}
-</urlset>`;
+
+</urlset>
+`;
 }
 
-async function main() {
-  console.log('Fetching anime list from AniList...');
-  const list = await fetchAllAnime();
-  console.log(`Fetched ${list.length} anime.`);
 
-  // SAFETY CHECK: agar AniList se kuch bhi data nahi mila (API down,
-  // rate-limited, HTTP 403/5xx, network issue, waghera), to yahin ruk jao.
-  // Warna neeche wala cleanup logic saari (bilkul theek) purani files ko
-  // "stale" samajh kar delete kar dega, kyunki khaali list mein koi bhi
-  // anime "current" nahi dikhega.
-  if (list.length === 0) {
-    console.error('Fetched 0 anime from AniList — aborting without touching any files. This usually means the AniList API is temporarily down, rate-limited, or blocked (e.g. HTTP 403/5xx). Nothing was deleted or overwritten. Try re-running the workflow in a few minutes.');
+// ============================================================
+// MAIN
+// ============================================================
+
+async function main() {
+
+  console.log('');
+  console.log('==========================================');
+  console.log(' BOSS Anime Club');
+  console.log(' Static SEO Page Generator');
+  console.log('==========================================');
+  console.log('');
+
+
+  // ----------------------------------------------------------
+  // FETCH DATA
+  // ----------------------------------------------------------
+
+  const result =
+    await fetchAllAnime();
+
+
+  const list =
+    result.anime;
+
+
+  const source =
+    result.source;
+
+
+  console.log(
+    `Fetched ${list.length} anime.`
+  );
+
+
+  // ----------------------------------------------------------
+  // CRITICAL SAFETY CHECK
+  // ----------------------------------------------------------
+
+  if (
+    !Array.isArray(list) ||
+    list.length === 0
+  ) {
+
+    console.error('');
+    console.error(
+      '=========================================='
+    );
+    console.error(
+      ' SAFETY STOP'
+    );
+    console.error(
+      '=========================================='
+    );
+    console.error(
+      'No anime data was received.'
+    );
+    console.error(
+      'No existing files were changed.'
+    );
+    console.error(
+      'No old anime pages were deleted.'
+    );
+    console.error(
+      '=========================================='
+    );
+    console.error('');
+
     process.exit(1);
   }
 
-  await mkdir(OUT_DIR, { recursive: true });
 
-  const currentFiles = new Set();
-  for (const m of list) {
-    const title = m.title?.english || m.title?.romaji || 'Untitled';
-    const slug = slugify(title);
-    const fileName = `${slug}-${m.id}.html`;
-    currentFiles.add(fileName);
-    const filePath = path.join(OUT_DIR, fileName);
-    await writeFile(filePath, pageHTML(m), 'utf8');
+  // ----------------------------------------------------------
+  // REQUIRE MINIMUM DATA
+  // ----------------------------------------------------------
+
+  if (list.length < 5) {
+
+    console.error(
+      `Only ${list.length} anime received.`
+    );
+
+    console.error(
+      'This is too little data for a safe deployment.'
+    );
+
+    console.error(
+      'Existing files will NOT be touched.'
+    );
+
+    process.exit(1);
   }
 
-  // Cleanup: koi bhi purani anime page jo ab top-200 popularity list mein
-  // nahi hai, use delete kar do — taaki dead weight jama na ho. index.html
-  // ko chhod dete hain kyunki wo har baar niche dobara likha jaata hai.
-  // (Yeh code sirf tab tak pahunchta hai jab list.length > 0 ho, upar wale
-  // safety check ki wajah se.)
-  const existingFiles = await readdir(OUT_DIR);
-  let deletedCount = 0;
-  for (const file of existingFiles) {
-    if (file === 'index.html') continue;
-    if (!file.endsWith('.html')) continue;
-    if (!currentFiles.has(file)) {
-      await unlink(path.join(OUT_DIR, file));
-      deletedCount++;
-      console.log(`Deleted stale page: ${file}`);
+
+  // ----------------------------------------------------------
+  // CREATE OUTPUT DIRECTORY
+  // ----------------------------------------------------------
+
+  await mkdir(
+    OUT_DIR,
+    {
+      recursive: true,
     }
+  );
+
+
+  // ----------------------------------------------------------
+  // WRITE INDIVIDUAL PAGES
+  // ----------------------------------------------------------
+
+  const currentFiles =
+    new Set();
+
+
+  let generatedCount = 0;
+
+
+  for (const anime of list) {
+
+    const title =
+      getTitle(anime);
+
+
+    const slug =
+      slugify(title);
+
+
+    const fileName =
+      `${slug}-${anime.id}.html`;
+
+
+    currentFiles.add(
+      fileName
+    );
+
+
+    const filePath =
+      path.join(
+        OUT_DIR,
+        fileName
+      );
+
+
+    await writeFile(
+      filePath,
+      pageHTML(anime),
+      'utf8'
+    );
+
+
+    generatedCount++;
+
+
+    if (
+      generatedCount % 25 === 0 ||
+      generatedCount === list.length
+    ) {
+
+      console.log(
+        `Generated ${generatedCount}/${list.length} pages...`
+      );
+
+    }
+
   }
 
-  await writeFile(path.join(OUT_DIR, 'index.html'), indexHTML(list), 'utf8');
-  await writeFile(path.join(process.cwd(), 'sitemap.xml'), sitemapXML(list), 'utf8');
 
-  console.log(`Done. Generated ${list.length} anime pages, deleted ${deletedCount} stale pages, + index + sitemap.xml.`);
+  // ----------------------------------------------------------
+  // WRITE INDEX
+  // ----------------------------------------------------------
+
+  await writeFile(
+    path.join(
+      OUT_DIR,
+      'index.html'
+    ),
+
+    indexHTML(
+      list,
+      source
+    ),
+
+    'utf8'
+  );
+
+
+  // ----------------------------------------------------------
+  // WRITE SITEMAP
+  // ----------------------------------------------------------
+
+  await writeFile(
+    path.join(
+      process.cwd(),
+      'sitemap.xml'
+    ),
+
+    sitemapXML(list),
+
+    'utf8'
+  );
+
+
+  // ----------------------------------------------------------
+  // CLEANUP STALE HTML
+  // ----------------------------------------------------------
+
+  //
+  // IMPORTANT:
+  // Cleanup happens ONLY after:
+  //
+  // 1. API returned valid data
+  // 2. At least 5 anime were received
+  // 3. New pages were successfully generated
+  // 4. index.html was successfully generated
+  // 5. sitemap.xml was successfully generated
+  //
+  // This prevents accidental deletion during API failure.
+  //
+
+  const existingFiles =
+    await readdir(
+      OUT_DIR
+    );
+
+
+  let deletedCount = 0;
+
+
+  for (const file of existingFiles) {
+
+    // Never delete index.
+    if (file === 'index.html') {
+      continue;
+    }
+
+
+    // Only remove generated HTML pages.
+    if (!file.endsWith('.html')) {
+      continue;
+    }
+
+
+    // Current page exists.
+    if (currentFiles.has(file)) {
+      continue;
+    }
+
+
+    try {
+
+      await unlink(
+        path.join(
+          OUT_DIR,
+          file
+        )
+      );
+
+
+      deletedCount++;
+
+
+      console.log(
+        `Deleted stale page: ${file}`
+      );
+
+    } catch (error) {
+
+      console.error(
+        `Could not delete stale page ${file}:`,
+        error?.message || error
+      );
+
+      throw error;
+    }
+
+  }
+
+
+  // ----------------------------------------------------------
+  // DONE
+  // ----------------------------------------------------------
+
+  console.log('');
+  console.log('==========================================');
+  console.log(' BUILD SUCCESS');
+  console.log('==========================================');
+  console.log(
+    `API source       : ${source}`
+  );
+  console.log(
+    `Anime generated  : ${generatedCount}`
+  );
+  console.log(
+    `Stale pages      : ${deletedCount}`
+  );
+  console.log(
+    `Index generated  : anime/index.html`
+  );
+  console.log(
+    `Sitemap generated: sitemap.xml`
+  );
+  console.log('==========================================');
+  console.log('');
+
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
 
+// ============================================================
+// GLOBAL ERROR HANDLER
+// ============================================================
+
+main().catch((error) => {
+
+  console.error('');
+  console.error(
+    '=========================================='
+  );
+  console.error(
+    ' BUILD FAILED'
+  );
+  console.error(
+    '=========================================='
+  );
+
+  console.error(
+    error?.stack ||
+    error?.message ||
+    error
+  );
+
+  console.error(
+    '=========================================='
+  );
+  console.error('');
+
+  process.exit(1);
+
+});
