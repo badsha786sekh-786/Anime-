@@ -506,7 +506,7 @@ ${genres.map((g) => `<span class="tag">${esc(g)}</span>`).join('')}
 <a class="backlink" href="${esc(SITE_URL)}/anime/index.html">&#9656; Browse all anime</a>
 
 <div class="source">
-Anime information is automatically generated and may be updated over time.
+Anime information.
 </div>
 
 <script>
