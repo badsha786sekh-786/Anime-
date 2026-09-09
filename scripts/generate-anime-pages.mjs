@@ -442,6 +442,13 @@ function pageHTML(anime) {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="icon" href="https://i.ibb.co/gLCc0JMk/favicon.jpg" sizes="any">
+<link rel="icon" type="image/png" sizes="16x16" href="https://i.ibb.co/DfcR4K8p/favicon-16.png">
+<link rel="icon" type="image/png" sizes="32x32" href="https://i.ibb.co/spHRWLbb/favicon-32.png">
+<link rel="icon" type="image/png" sizes="48x48" href="https://i.ibb.co/BKNyQpj6/favicon-48.png">
+<link rel="icon" type="image/png" sizes="192x192" href="https://i.ibb.co/JFrhqwwT/favicon-192.png">
+<link rel="apple-touch-icon" sizes="180x180" href="https://i.ibb.co/VYFv3GrN/apple-touch-icon.png">
+
 <title>${esc(title)} &mdash; Watch Guide, Info &amp; Episodes | BOSS Anime Club</title>
 <meta name="description" content="${esc(title)} (${esc(year)}) &mdash; ${esc(synopsis.slice(0, 155))}">
 <link rel="canonical" href="${esc(url)}">
@@ -506,7 +513,7 @@ ${genres.map((g) => `<span class="tag">${esc(g)}</span>`).join('')}
 <a class="backlink" href="${esc(SITE_URL)}/anime/index.html">&#9656; Browse all anime</a>
 
 <div class="source">
-Anime information.
+Anime information is automatically generated and may be updated over time.
 </div>
 
 <script>
@@ -579,6 +586,13 @@ function indexHTML(list, source) {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="icon" href="https://i.ibb.co/gLCc0JMk/favicon.jpg" sizes="any">
+<link rel="icon" type="image/png" sizes="16x16" href="https://i.ibb.co/DfcR4K8p/favicon-16.png">
+<link rel="icon" type="image/png" sizes="32x32" href="https://i.ibb.co/spHRWLbb/favicon-32.png">
+<link rel="icon" type="image/png" sizes="48x48" href="https://i.ibb.co/BKNyQpj6/favicon-48.png">
+<link rel="icon" type="image/png" sizes="192x192" href="https://i.ibb.co/JFrhqwwT/favicon-192.png">
+<link rel="apple-touch-icon" sizes="180x180" href="https://i.ibb.co/VYFv3GrN/apple-touch-icon.png">
+
 <title>Browse All Anime | BOSS Anime Club</title>
 <meta name="description" content="Browse anime on BOSS Anime Club with synopsis, episodes, genres, scores and studio information.">
 <link rel="canonical" href="${SITE_URL}/anime/index.html">
@@ -732,3 +746,4 @@ main().catch((error) => {
   console.error('Existing files were not intentionally deleted.');
   process.exit(1);
 });
+
