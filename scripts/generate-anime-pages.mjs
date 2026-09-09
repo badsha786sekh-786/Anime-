@@ -252,15 +252,30 @@ async function fetchFromAniList() {
   const all = [];
   const seen = new Set();
   let complete = true;
+  let consecutiveFailures = 0;
 
+  // NOTE (fix): pehle koi ek page fail hone par poora loop turant "break"
+  // ho jaata tha, isliye baaki bache hue pages kabhi try hi nahi hote the —
+  // isi wajah se 200 ki jagah sirf kuch anime mil paate the. Ab hum ek fail
+  // hui page ko skip karke agli pages try karte rehte hain, taaki jitna ho
+  // sake utna data mil jaaye. Sirf agar lagataar 3 pages fail ho jaayein
+  // (matlab poori API hi down hai) tab hi rukte hain — bewajah retry na ho.
   for (let page = 1; page <= ANILIST_PAGES; page++) {
     const data = await fetchAniListPage(page);
 
     if (!data || data.length === 0) {
       complete = false;
-      console.warn(`AniList unavailable/empty on page ${page}.`);
-      break;
+      consecutiveFailures++;
+      console.warn(`AniList unavailable/empty on page ${page}. (${consecutiveFailures} consecutive failures)`);
+      if (consecutiveFailures >= 3) {
+        console.warn('AniList failed 3 pages in a row — stopping early.');
+        break;
+      }
+      await sleep(1500);
+      continue;
     }
+
+    consecutiveFailures = 0;
 
     for (const anime of data) {
       if (!seen.has(anime.id)) {
@@ -284,7 +299,9 @@ async function fetchJikanPage(page) {
 
   console.log(`Jikan: fetching page ${page}/${JIKAN_PAGES}...`);
 
-  const result = await fetchJsonWithRetry(url, {}, 4);
+  // Jikan ka free tier kabhi-kabhi 504 (timeout) deta hai load ke waqt —
+  // isliye isko zyada retries (6) aur lamba wait diya gaya hai.
+  const result = await fetchJsonWithRetry(url, {}, 6);
 
   if (!result.ok) return null;
 
@@ -298,15 +315,30 @@ async function fetchFromJikan() {
   const all = [];
   const seen = new Set();
   let complete = true;
+  let consecutiveFailures = 0;
 
+  // NOTE (fix): jaisa AniList mein upar kiya, yahan bhi ek fail hui page ko
+  // skip karke agli pages try karte hain, taaki 200 ke jitna kareeb ho sake
+  // utna data mil sake — sirf poore-source down hone par (3 lagataar fails)
+  // hi rukte hain.
   for (let page = 1; page <= JIKAN_PAGES; page++) {
     const data = await fetchJikanPage(page);
 
     if (!data || data.length === 0) {
       complete = false;
-      console.warn(`Jikan unavailable/empty on page ${page}.`);
-      break;
+      consecutiveFailures++;
+      console.warn(`Jikan unavailable/empty on page ${page}. (${consecutiveFailures} consecutive failures)`);
+      if (consecutiveFailures >= 3) {
+        console.warn('Jikan failed 3 pages in a row — stopping early.');
+        break;
+      }
+      // Ek fail hui page ke baad thoda extra wait, taaki Jikan ke server
+      // ko saans lene ka time mile before agli request.
+      await sleep(3000);
+      continue;
     }
+
+    consecutiveFailures = 0;
 
     for (const anime of data) {
       if (!seen.has(anime.id)) {
@@ -746,4 +778,3 @@ main().catch((error) => {
   console.error('Existing files were not intentionally deleted.');
   process.exit(1);
 });
-
