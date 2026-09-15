@@ -1390,7 +1390,6 @@ document.addEventListener('keydown', (e)=>{ if(e.key === 'Escape') closeModal();
 // text with an English voice, which still sounds fine since the text itself
 // is already in Latin letters.
 const WORKER_URL = 'https://anime.badsha90sekh.workers.dev'; // deployed EasyVoice proxy Worker
-const EASYVOICE_VOICE = 'af_aoede'; // one of the 12 free-tier voices
 
 // Groq Worker translates the synopsis directly into natural Roman Hinglish.
 const GROQ_WORKER_URL = 'https://groq-proxy.badsha90sekh.workers.dev';
@@ -1398,7 +1397,7 @@ const GROQ_WORKER_URL = 'https://groq-proxy.badsha90sekh.workers.dev';
 let hindiCache = '';
 let currentAudio = null;
 
-async function easyVoiceSpeak(text, lang, voice){
+async function easyVoiceSpeak(text, lang){
   if(!WORKER_URL) throw new Error('worker_not_configured');
   const stopBtn = document.getElementById('stopBtn');
   if(currentAudio){ currentAudio.pause(); currentAudio = null; }
@@ -1409,7 +1408,6 @@ async function easyVoiceSpeak(text, lang, voice){
     body: JSON.stringify({
       text: String(text || '').slice(0, 4900),
       lang: lang || 'en',
-      voice: voice || EASYVOICE_VOICE,
       format: 'mp3'
     })
   });
@@ -1572,7 +1570,7 @@ async function translateToHinglishWithRetry(sourceText, logFn, maxAttempts){
 async function speakWithRetry(text, lang, evLang, logFn){
   logFn && logFn('Voice taiyar ho raha hai…');
   try{
-    await easyVoiceSpeak(text, evLang, EASYVOICE_VOICE);
+    await easyVoiceSpeak(text, evLang);
     return true;
   }catch(e){
     if(e.status === 429){
@@ -1590,7 +1588,7 @@ async function speakWithRetry(text, lang, evLang, logFn){
 
 async function speak(t, lang, evLang, logFn){
   try{
-    await easyVoiceSpeak(t, evLang, EASYVOICE_VOICE);
+    await easyVoiceSpeak(t, evLang);
     return true;
   }catch(e){
     if(e.message === 'worker_not_configured'){
@@ -1671,3 +1669,4 @@ loadTrending();
 </script>
 </body>
 </html>
+
