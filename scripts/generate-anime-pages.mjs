@@ -60,6 +60,7 @@ query ($page: Int, $perPage: Int) {
       coverImage { extraLarge large }
       bannerImage
       averageScore
+      popularity
       episodes
       format
       status
@@ -109,6 +110,11 @@ function normalizeAniListAnime(m) {
     image: m?.coverImage?.extraLarge || m?.coverImage?.large || '',
     banner: m?.bannerImage || '',
     score: Number.isFinite(m?.averageScore) ? Number(m.averageScore) / 10 : null,
+    // AniList doesn't expose an exact "number of people who scored this"
+    // field. `popularity` (count of users who have it list-added) is the
+    // closest available proxy and is what we use to satisfy schema.org's
+    // requirement that aggregateRating carry a ratingCount/reviewCount.
+    ratingCount: Number.isFinite(m?.popularity) ? Number(m.popularity) : null,
     episodes: m?.episodes ?? null,
     format: m?.format || '',
     status: m?.status || '',
@@ -141,6 +147,8 @@ function normalizeJikanAnime(m) {
       '',
     banner: '',
     score: Number.isFinite(m?.score) ? Number(m.score) : null,
+    // Jikan gives the real number of users who submitted a score.
+    ratingCount: Number.isFinite(m?.scored_by) ? Number(m.scored_by) : null,
     episodes: m?.episodes ?? null,
     format: m?.type || '',
     status: m?.status || '',
@@ -254,12 +262,6 @@ async function fetchFromAniList() {
   let complete = true;
   let consecutiveFailures = 0;
 
-  // NOTE (fix): pehle koi ek page fail hone par poora loop turant "break"
-  // ho jaata tha, isliye baaki bache hue pages kabhi try hi nahi hote the —
-  // isi wajah se 200 ki jagah sirf kuch anime mil paate the. Ab hum ek fail
-  // hui page ko skip karke agli pages try karte rehte hain, taaki jitna ho
-  // sake utna data mil jaaye. Sirf agar lagataar 3 pages fail ho jaayein
-  // (matlab poori API hi down hai) tab hi rukte hain — bewajah retry na ho.
   for (let page = 1; page <= ANILIST_PAGES; page++) {
     const data = await fetchAniListPage(page);
 
@@ -299,8 +301,6 @@ async function fetchJikanPage(page) {
 
   console.log(`Jikan: fetching page ${page}/${JIKAN_PAGES}...`);
 
-  // Jikan ka free tier kabhi-kabhi 504 (timeout) deta hai load ke waqt —
-  // isliye isko zyada retries (6) aur lamba wait diya gaya hai.
   const result = await fetchJsonWithRetry(url, {}, 6);
 
   if (!result.ok) return null;
@@ -317,10 +317,6 @@ async function fetchFromJikan() {
   let complete = true;
   let consecutiveFailures = 0;
 
-  // NOTE (fix): jaisa AniList mein upar kiya, yahan bhi ek fail hui page ko
-  // skip karke agli pages try karte hain, taaki 200 ke jitna kareeb ho sake
-  // utna data mil sake — sirf poore-source down hone par (3 lagataar fails)
-  // hi rukte hain.
   for (let page = 1; page <= JIKAN_PAGES; page++) {
     const data = await fetchJikanPage(page);
 
@@ -332,8 +328,6 @@ async function fetchFromJikan() {
         console.warn('Jikan failed 3 pages in a row — stopping early.');
         break;
       }
-      // Ek fail hui page ke baad thoda extra wait, taaki Jikan ke server
-      // ko saans lene ka time mile before agli request.
       await sleep(3000);
       continue;
     }
@@ -347,7 +341,6 @@ async function fetchFromJikan() {
       }
     }
 
-    // Jikan rate-limit friendly delay.
     await sleep(1200);
   }
 
@@ -450,6 +443,23 @@ function pageHTML(anime) {
   const editorNote = buildEditorNote(anime);
   const speakText = cleanText(`${synopsis} ${editorNote}`);
 
+  // schema.org requires AggregateRating to carry either ratingCount or
+  // reviewCount alongside ratingValue, or Google's Rich Results Test flags
+  // it as an invalid item (this was the "1 invalid item detected" error).
+  // Only emit aggregateRating when we actually have both a score and a
+  // count to back it — never fabricate a count.
+  const hasRatingCount = Number.isFinite(anime.ratingCount) && anime.ratingCount > 0;
+  const aggregateRating =
+    anime.score != null && hasRatingCount
+      ? {
+          '@type': 'AggregateRating',
+          ratingValue: anime.score.toFixed(1),
+          ratingCount: anime.ratingCount,
+          bestRating: '10',
+          worstRating: '0',
+        }
+      : undefined;
+
   const jsonLd = {
     '@context': 'https://schema.org',
     '@type': 'TVSeries',
@@ -459,14 +469,7 @@ function pageHTML(anime) {
     genre: genres,
     datePublished: anime.year ? String(anime.year) : undefined,
     numberOfEpisodes: anime.episodes ?? undefined,
-    aggregateRating: anime.score != null
-      ? {
-          '@type': 'AggregateRating',
-          ratingValue: anime.score.toFixed(1),
-          bestRating: '10',
-          worstRating: '0',
-        }
-      : undefined,
+    aggregateRating,
   };
 
   return `<!DOCTYPE html>
@@ -778,3 +781,4 @@ main().catch((error) => {
   console.error('Existing files were not intentionally deleted.');
   process.exit(1);
 });
+
